@@ -9,7 +9,7 @@
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
     #controls { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
     #chart { border: 1px solid #ddd; max-width: 100%; height: auto; }
-    .exon { fill: #3b82f6; }
+    .exon { fill: black; }
     .arc { fill: none; stroke: #111827; opacity: 0.8; }
     .baseline { stroke: #9ca3af; }
     .arc-label {
@@ -21,7 +21,7 @@
       stroke-width: 3px; /* halo for readability */
     }
     .muted { color: #6b7280; font-size: 12px; }
-    .cov-area { fill: #93c5fd55; }
+    .cov-area { /* per-sample fill set inline via JS */ }
     .lane-label { text-anchor: end; fill: #374151; font-size: 12px; }
     /* Heatmap */
     .heat-cell { stroke: #e5e7eb; }
@@ -60,9 +60,60 @@
   </div>
   <div class="muted" id="credit">Made by Chloe Zhang (chloe.zhang@helsinki.fi)</div>
 
+  <!-- Optional inline data fallback for file:// usage -->
+  <script id="exons-inline" type="application/json">
+  {
+    "events": [
+      {
+        "name": "Event A",
+        "exons": [
+          { "start": 100, "end": 200 },
+          { "start": 400, "end": 450 },
+          { "start": 800, "end": 880 }
+        ]
+      },
+      {
+        "name": "Event B",
+        "exons": [
+          { "start": 220, "end": 300 },
+          { "start": 620, "end": 670 },
+          { "start": 1020, "end": 1100 }
+        ]
+      },
+      {
+        "name": "Event C",
+        "exons": [
+          { "start": 140, "end": 190 },
+          { "start": 520, "end": 590 },
+          { "start": 900, "end": 980 }
+        ]
+      }
+    ]
+  }
+  </script>
+  <script id="junctions-inline" type="application/json">
+  {
+    "Event A": [
+      { "start": 200, "end": 400, "counts": [52, 48, 60, 8,  2,  5] },
+      { "start": 450, "end": 800, "counts": [14, 18, 12, 4,  9,  7] },
+      { "start": 199, "end": 881, "counts": [22, 28, 25, 10, 12,  8], "below": true }
+    ],
+    "Event B": [
+      { "start": 300, "end": 620,  "counts": [40, 38, 35, 20, 22, 18] },
+      { "start": 670, "end": 1020, "counts": [9,  12, 10,  6,  8,  5] },
+      { "start": 299, "end": 1101, "counts": [28, 32, 30, 12, 14, 10], "below": true }
+    ],
+    "Event C": [
+      { "start": 190, "end": 520,  "counts": [36, 34, 30, 16, 18, 14] },
+      { "start": 590, "end": 900,  "counts": [18, 16, 20,  9, 11,  7] },
+      { "start": 189, "end": 981,  "counts": [15, 19, 17,  8, 10,  6], "below": true }
+    ]
+  }
+  </script>
+
   <script>
     // Define three different genes (events) with exons and base junctions
-    const eventDefs = [
+    const defaultEventDefs = [
       {
         name: "Event A",
         exons: [ { start: 100, end: 200 }, { start: 400, end: 450 }, { start: 800, end: 880 } ],
@@ -80,7 +131,7 @@
       },
     ];
     // Build base junctions for each event: two canonicals + one long skip (below)
-    for (const ev of eventDefs) {
+    for (const ev of defaultEventDefs) {
       const exs = ev.exons;
       const jb = [];
       // canonical junctions: between exon1->exon2, exon2->exon3
@@ -118,15 +169,16 @@
     // Color grouping: first three (healthy) blue, last three (disease) red
     const strokeColors = ["#2563eb", "#2563eb", "#2563eb", "#dc2626", "#dc2626", "#dc2626"];
     const trackNames = ["sample1","sample2","sample3","sample4","sample5","sample6"];
-    const eventNames = eventDefs.map(d => d.name);
-    const fillColors = [
-      "rgba(37,99,235,0.25)",
-      "rgba(37,99,235,0.25)",
-      "rgba(37,99,235,0.25)",
-      "rgba(220,38,38,0.25)",
-      "rgba(220,38,38,0.25)",
-      "rgba(220,38,38,0.25)",
-    ];
+    let eventDefs = defaultEventDefs.slice();
+    let eventNames = eventDefs.map(d => d.name);
+    let junctionDefs = null; // optional external junction definitions by event name
+    // Helper to create translucent fill matching stroke color
+    function withAlpha(color, alpha=0.25) {
+      const c = d3.color(color);
+      if (!c) return color;
+      c.opacity = alpha;
+      return c.formatRgb();
+    }
 
     // Simulate per-sample junction counts by varying base counts deterministically
     function varyCount(base, laneIdx, jIdx) {
@@ -135,16 +187,69 @@
       return Math.max(0, Math.round(base * factor));
     }
     // PSI matrix (samples x events), values 0..1
-    const psiMatrix = trackNames.map((_, i) => eventNames.map((_, j) => {
-      const v = Math.sin((i + 1) * 0.8 + j * 1.2) * 0.5 + 0.5;
-      return Math.round((0.15 + 0.75 * v) * 100) / 100;
-    }));
+    function buildPsiMatrix() {
+      return trackNames.map((_, i) => eventNames.map((_, j) => {
+        const v = Math.sin((i + 1) * 0.8 + j * 1.2) * 0.5 + 0.5;
+        return Math.round((0.15 + 0.75 * v) * 100) / 100;
+      }));
+    }
+    let psiMatrix = buildPsiMatrix();
     // State: selected event index
     let currentEvent = 0;
 
+    // Replace eventDefs from external JSON [{name, exons:[{start,end},...]},...]
+    function setEventDefs(newDefs) {
+      try {
+        if (!Array.isArray(newDefs)) throw new Error("events must be an array");
+        // Normalize and build junctionBase for each event
+        eventDefs = newDefs.map((ev, idx) => {
+          const name = ev.name || `Event ${idx+1}`;
+          const exons = (ev.exons || []).map(e => ({ start: +e.start, end: +e.end })).sort((a,b)=>a.start-b.start);
+          const jb = [];
+          if (exons.length >= 2) jb.push({ start: exons[0].end, end: exons[1].start, count: 50 });
+          if (exons.length >= 3) jb.push({ start: exons[1].end, end: exons[2].start, count: 15 });
+          if (exons.length >= 3) jb.push({ start: exons[0].end - 1, end: exons[2].start + 1, count: 25, below: true });
+          return { name, exons, junctionBase: jb };
+        });
+        eventNames = eventDefs.map(d => d.name);
+        psiMatrix = buildPsiMatrix();
+        if (currentEvent >= eventDefs.length) currentEvent = 0;
+        drawHeatmap();
+        updateHeatmapSelection();
+        update();
+      } catch (e) {
+        console.error("Invalid event defs:", e);
+        alert("Failed to load exons JSON: " + e.message);
+      }
+    }
+
+    // Replace junction definitions from external JSON mapping: { "Event A": [ {start,end,count,below?}, ... ], ... }
+    function setJunctionDefs(newDefs) {
+      try {
+        if (!newDefs || typeof newDefs !== 'object') throw new Error("junctions must be an object keyed by event name");
+        junctionDefs = newDefs;
+        update();
+      } catch (e) {
+        console.error("Invalid junction defs:", e);
+        alert("Failed to load junctions JSON: " + e.message);
+      }
+    }
+
     function buildJunctionTracksForEvent(eventIdx, covTracks) {
-      const base = (eventDefs[eventIdx] && eventDefs[eventIdx].junctionBase) || [];
-      const tracks = covTracks.map((_, i) => base.map((j, jIdx) => ({ ...j, count: varyCount(j.count, i, jIdx) })));
+      const ev = eventDefs[eventIdx] || {};
+      const name = ev.name;
+      const base = (junctionDefs && junctionDefs[name]) || ev.junctionBase || [];
+      // Build per-sample tracks using counts array when provided
+      const tracks = covTracks.map((_, i) => base.map((j, jIdx) => {
+        let cnt = 0;
+        if (Array.isArray(j.counts)) {
+          cnt = Number(j.counts[i] ?? 0);
+        } else if (j.count != null) {
+          // fallback: derive per-sample from a single count using deterministic variation
+          cnt = varyCount(Number(j.count), i, jIdx);
+        }
+        return { start: j.start, end: j.end, below: !!j.below, count: Math.max(0, Math.round(cnt)) };
+      }));
       const maxCountGlobal = d3.max(tracks, tr => d3.max(tr, d => d.count)) || 1;
       return { tracks, maxCountGlobal };
     }
@@ -180,8 +285,8 @@
         .attr("text-anchor", "end")
         .text(d => d);
 
-      hg.selectAll("text.hcol").data(eventNames.map((name, j) => ({ name, j })))
-        .join(
+      const cols = hg.selectAll("text.hcol").data(eventNames.map((name, j) => ({ name, j })), d => d.name);
+      cols.join(
           enter => enter.append("text").attr("class", "heat-header hcol"),
           update => update
         )
@@ -352,7 +457,8 @@
               update => update
             )
             .attr("d", areaGen)
-            .attr("fill", fillColors[i % fillColors.length]);
+            // Per-sample coverage fill: samples 1–3 blue, 4–6 red
+            .style("fill", withAlpha(strokeColors[i % strokeColors.length], 0.25));
 
           // Lane label in the left margin
           gtrack.selectAll("text.lane-label").data([trackNames[i] || `sample${i+1}`])
@@ -458,6 +564,27 @@
     slider.addEventListener("input", update);
     minSlider.addEventListener("input", update);
     window.addEventListener("resize", update);
+    // Inline JSON fallback for file:// usage
+    try {
+      const exInline = document.getElementById('exons-inline');
+      if (exInline && exInline.textContent.trim()) {
+        const data = JSON.parse(exInline.textContent);
+        setEventDefs(data.events || data);
+      }
+      const jInline = document.getElementById('junctions-inline');
+      if (jInline && jInline.textContent.trim()) {
+        const j = JSON.parse(jInline.textContent);
+        setJunctionDefs(j.events || j);
+      }
+    } catch (e) { console.warn('Inline data parse failed', e); }
+
+    // Auto-load exons.json and junctions.json when served over HTTP(S)
+    if (location.protocol.startsWith('http')) {
+      fetch('exons.json').then(r => r.ok ? r.json() : null).then(data => {
+        if (data) setEventDefs(data.events || data);
+        return fetch('junctions.json').then(r => r.ok ? r.json() : null);
+      }).then(j => { if (j) setJunctionDefs(j.events || j); }).catch(() => {});
+    }
     drawHeatmap();
     update();
   </script>
