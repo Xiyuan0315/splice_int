@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Interactive Sashimi with Intron Scaling</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    #controls { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    #chart { border: 1px solid #ddd; max-width: 100%; height: auto; }
+    .exon { fill: #3b82f6; }
+    .arc { fill: none; stroke: #111827; opacity: 0.8; }
+    .baseline { stroke: #9ca3af; }
+    .arc-label {
+      font: 11px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      text-anchor: middle;
+      fill: #111827;
+      paint-order: stroke;
+      stroke: white;
+      stroke-width: 3px; /* halo for readability */
+    }
+    .muted { color: #6b7280; font-size: 12px; }
+    .cov-area { fill: #93c5fd55; }
+    .lane-label { text-anchor: end; fill: #374151; font-size: 12px; }
+    /* Heatmap */
+    .heat-cell { stroke: #e5e7eb; }
+    .heat-header { font-size: 12px; cursor: pointer; fill: #111827; }
+    .heat-axis { fill: #374151; font-size: 12px; }
+    .heat-select { fill: none; stroke: #111827; stroke-width: 2px; pointer-events: none; }
+    #panels { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+    #heatmap { flex: 0 0 420px; }
+    #chart { flex: 1 1 0; width: 100%; min-width: 360px; }
+  </style>
+  <!-- d3 via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script>
+    // Minimal helper to parse query params for quick data swapping if needed
+    function qp(name, fallback) {
+      const u = new URL(window.location);
+      return u.searchParams.get(name) ?? fallback;
+    }
+  </script>
+</head>
+<body>
+  <h3>Interactive Sashimi (D3) — Intron Compression Slider</h3>
+  <div class="muted">Exons keep genomic scale; introns scale by α ∈ [0,1].</div>
+  <div id="controls">
+    <label for="intronScale">Intron scaling α</label>
+    <input id="intronScale" type="range" min="0" max="1" step="0.01" value="0.1" />
+    <span id="scaleLabel">0.10</span>
+    <span style="width:16px"></span>
+    <label for="minCount">Min junction reads</label>
+    <input id="minCount" type="range" min="0" max="100" step="1" value="0" />
+    <span id="minLabel">0</span>
+  </div>
+  <div id="panels">
+    <svg id="heatmap" width="420" height="190" role="img" aria-label="PSI heatmap"></svg>
+    <svg id="chart" width="900" height="450" role="img" aria-label="Sashimi plot"></svg>
+  </div>
+  <div class="muted" id="credit">Made by Chloe Zhang (chloe.zhang@helsinki.fi)</div>
+
+  <script>
+    // Define three different genes (events) with exons and base junctions
+    const eventDefs = [
+      {
+        name: "Event A",
+        exons: [ { start: 100, end: 200 }, { start: 400, end: 450 }, { start: 800, end: 880 } ],
+        junctionBase: null, // filled below
+      },
+      {
+        name: "Event B",
+        exons: [ { start: 220, end: 300 }, { start: 620, end: 670 }, { start: 1020, end: 1100 } ],
+        junctionBase: null,
+      },
+      {
+        name: "Event C",
+        exons: [ { start: 140, end: 190 }, { start: 520, end: 590 }, { start: 900, end: 980 } ],
+        junctionBase: null,
+      },
+    ];
+    // Build base junctions for each event: two canonicals + one long skip (below)
+    for (const ev of eventDefs) {
+      const exs = ev.exons;
+      const jb = [];
+      // canonical junctions: between exon1->exon2, exon2->exon3
+      jb.push({ start: exs[0].end, end: exs[1].start, count: 50 });
+      jb.push({ start: exs[1].end, end: exs[2].start, count: 15 });
+      // long skip below: exon1->exon3
+      jb.push({ start: exs[0].end - 1, end: exs[2].start + 1, count: 25, below: true });
+      ev.junctionBase = jb;
+    }
+
+    // Coverage generator for an exons set
+    function demoCoverageForGene(exons, seed = 0) {
+      const rand = (x) => Math.sin((x + 37 * seed) * 0.017) * 0.5 + 0.5; // deterministic
+      const pts = [];
+      const step = 5; // bp sampling step for demo
+      const centers = exons.map(e => (e.start + e.end) / 2);
+      const geneStart = exons[0].start;
+      const geneEnd = exons[exons.length - 1].end;
+      const amp = 0.8 + 0.5 * (seed % 3);  // vary amplitude a bit
+      const width = 40 + 10 * (seed % 5);  // vary gaussian width
+      for (let p = geneStart; p <= geneEnd; p += step) {
+        let c = 0;
+        for (const m of centers) {
+          const d = Math.abs(p - m);
+          c += 35 * amp * Math.exp(-(d * d) / (2 * width * width));
+        }
+        c += 4 * rand(p * 0.9 + seed * 123); // gentle wiggle per-seed
+        pts.push({ pos: p, cov: Math.max(0, c) });
+      }
+      return pts;
+    }
+    function buildCoverageTracks(exons) {
+      return [0,1,2,3,4,5].map(s => demoCoverageForGene(exons, s));
+    }
+    // Color grouping: first three (healthy) blue, last three (disease) red
+    const strokeColors = ["#2563eb", "#2563eb", "#2563eb", "#dc2626", "#dc2626", "#dc2626"];
+    const trackNames = ["sample1","sample2","sample3","sample4","sample5","sample6"];
+    const eventNames = eventDefs.map(d => d.name);
+    const fillColors = [
+      "rgba(37,99,235,0.25)",
+      "rgba(37,99,235,0.25)",
+      "rgba(37,99,235,0.25)",
+      "rgba(220,38,38,0.25)",
+      "rgba(220,38,38,0.25)",
+      "rgba(220,38,38,0.25)",
+    ];
+
+    // Simulate per-sample junction counts by varying base counts deterministically
+    function varyCount(base, laneIdx, jIdx) {
+      const t = Math.sin((laneIdx + 1) * 1.7 + jIdx * 0.9) * 0.5 + 0.5; // 0..1
+      const factor = 0.6 + 0.9 * t; // ~0.6..1.5
+      return Math.max(0, Math.round(base * factor));
+    }
+    // PSI matrix (samples x events), values 0..1
+    const psiMatrix = trackNames.map((_, i) => eventNames.map((_, j) => {
+      const v = Math.sin((i + 1) * 0.8 + j * 1.2) * 0.5 + 0.5;
+      return Math.round((0.15 + 0.75 * v) * 100) / 100;
+    }));
+    // State: selected event index
+    let currentEvent = 0;
+
+    function buildJunctionTracksForEvent(eventIdx, covTracks) {
+      const base = (eventDefs[eventIdx] && eventDefs[eventIdx].junctionBase) || [];
+      const tracks = covTracks.map((_, i) => base.map((j, jIdx) => ({ ...j, count: varyCount(j.count, i, jIdx) })));
+      const maxCountGlobal = d3.max(tracks, tr => d3.max(tr, d => d.count)) || 1;
+      return { tracks, maxCountGlobal };
+    }
+
+    // SVG & layout
+    const hsvg = d3.select("#heatmap");
+    const svg = d3.select("#chart");
+    const height = +svg.attr("height");
+    const margin = { top: 20, right: 20, bottom: 30, left: 100 }; // extra left room for labels
+    function chartWidth() { return Math.max(100, (svg.node() && svg.node().clientWidth) || +svg.attr("width")); }
+    const baselineY = height - 60; // baseline for exons/arcs (moved down a bit)
+    const exonHeight = 18;
+    const maxArcHeight = 60; // cap arc height to keep below arcs in view
+
+    const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+    // Heatmap layout and draw
+    const hm = { margin: { top: 28, right: 10, bottom: 10, left: 100 }, cellW: 90, cellH: 22, gap: 4 };
+    const hInnerW = +hsvg.attr("width") - hm.margin.left - hm.margin.right;
+    const hInnerH = +hsvg.attr("height") - hm.margin.top - hm.margin.bottom;
+    const hg = hsvg.append("g").attr("transform", `translate(${hm.margin.left},${hm.margin.top})`);
+    const psiColor = d3.scaleLinear()
+      .domain([0, 0.5, 1])
+      .range(["#f7fbff", "#9ecae1", "#08519c"]);
+
+    function drawHeatmap() {
+      // axes labels
+      hg.selectAll("text.hrow").data(trackNames)
+        .join(
+          enter => enter.append("text").attr("class", "heat-axis hrow"),
+          update => update
+        )
+        .attr("x", -8).attr("y", (_, i) => i * (hm.cellH + hm.gap) + 14)
+        .attr("text-anchor", "end")
+        .text(d => d);
+
+      hg.selectAll("text.hcol").data(eventNames.map((name, j) => ({ name, j })))
+        .join(
+          enter => enter.append("text").attr("class", "heat-header hcol"),
+          update => update
+        )
+        .attr("x", d => d.j * (hm.cellW + hm.gap) + hm.cellW / 2)
+        .attr("y", -8)
+        .attr("text-anchor", "middle")
+        .text(d => d.name)
+        .on("click", (ev, d) => { currentEvent = d.j; updateHeatmapSelection(); update(); });
+
+      // cells
+      const cells = hg.selectAll("g.row").data(psiMatrix);
+      cells.join(enter => enter.append("g").attr("class", "row"), update => update)
+        .each(function(row, i) {
+          const grow = d3.select(this);
+          const items = grow.selectAll("rect.heat-cell").data(row.map((v, j) => ({ v, i, j })));
+          items.join(
+            enter => enter.append("rect").attr("class", "heat-cell"),
+            update => update
+          )
+          .attr("x", d => d.j * (hm.cellW + hm.gap))
+          .attr("y", i * (hm.cellH + hm.gap))
+          .attr("width", hm.cellW)
+          .attr("height", hm.cellH)
+          .attr("fill", d => psiColor(d.v))
+          .on("click", (ev, d) => { currentEvent = d.j; updateHeatmapSelection(); update(); });
+        });
+
+      // selection highlight
+      updateHeatmapSelection();
+    }
+
+    function updateHeatmapSelection() {
+      const sel = hg.selectAll("rect.heat-select").data([currentEvent]);
+      sel.join(
+        enter => enter.append("rect").attr("class", "heat-select"),
+        update => update
+      )
+      .attr("x", d => d * (hm.cellW + hm.gap) - 2)
+      .attr("y", -hm.cellH - 6)
+      .attr("width", hm.cellW + 4)
+      .attr("height", trackNames.length * (hm.cellH + hm.gap) + hm.cellH + 10);
+    }
+
+    // Preprocess segments (exon/intron) for mapping
+    function buildSegments(exons) {
+      const sorted = exons.slice().sort((a, b) => a.start - b.start);
+      const segments = [];
+      let lastEnd = sorted[0].start;
+      for (let i = 0; i < sorted.length; i++) {
+        const e = sorted[i];
+        if (e.start > lastEnd) {
+          segments.push({ type: "intron", start: lastEnd, end: e.start, length: e.start - lastEnd });
+        }
+        segments.push({ type: "exon", start: e.start, end: e.end, length: e.end - e.start, ref: e });
+        lastEnd = e.end;
+      }
+      return { segments };
+    }
+
+    // Helpers to snap junction endpoints to exon edges
+    function exonRightEdgeAtOrBefore(pos, exons) {
+      // Prefer containing exon.end; else the closest exon end <= pos
+      let candidate = null; // numeric
+      for (const e of exons) {
+        if (pos >= e.start && pos <= e.end) return e.end;
+        if (e.end <= pos) {
+          if (candidate === null || e.end > candidate) candidate = e.end;
+        }
+      }
+      return candidate ?? exons[0].start;
+    }
+
+    function exonLeftEdgeAtOrAfter(pos, exons) {
+      // Prefer containing exon.start; else the closest exon start >= pos
+      let candidate = null; // numeric
+      for (const e of exons) {
+        if (pos >= e.start && pos <= e.end) return e.start;
+        if (e.start >= pos) {
+          if (candidate === null || e.start < candidate) candidate = e.start;
+        }
+      }
+      return candidate ?? exons[exons.length - 1].end;
+    }
+
+    function makeMapper(segments, innerWidth, s) {
+      // Display length per segment: exons = 1x, introns = s x
+      const disp = segments.map(seg => ({
+        ...seg,
+        dlen: seg.length * (seg.type === "exon" ? 1 : s),
+      }));
+      const totalDisp = d3.sum(disp, d => d.dlen) || 1;
+      const pxPer = innerWidth / totalDisp;
+      let cum = 0;
+      for (const d of disp) { d.cumStart = cum; cum += d.dlen; }
+      function map(pos) {
+        const seg = disp.find(d => pos >= d.start && pos <= d.end) ||
+                    (pos < disp[0].start ? disp[0] : disp[disp.length - 1]);
+        const scale = (seg.type === "exon") ? 1 : s;
+        const clamped = Math.max(seg.start, Math.min(seg.end, pos));
+        const local = (clamped - seg.start) * scale;
+        return seg.cumStart * pxPer + local * pxPer;
+      }
+      return { map, pxPer };
+    }
+
+    // Arc height scaling computed per draw based on selected event
+
+    // Baseline
+    const initInnerW = chartWidth() - margin.left - margin.right;
+    g.append("line")
+      .attr("class", "baseline")
+      .attr("x1", 0)
+      .attr("x2", initInnerW)
+      .attr("y1", baselineY)
+      .attr("y2", baselineY)
+      .attr("stroke-width", 1);
+
+    const covG = g.append("g");
+    const exonG = g.append("g");
+
+    function draw(s, minReads, jdata, covTracks, exons) {
+      const cw = chartWidth();
+      const innerW = cw - margin.left - margin.right;
+      // keep baseline line width in sync with container
+      g.select("line.baseline").attr("x2", innerW);
+      const { segments } = buildSegments(exons);
+      const { map } = makeMapper(segments, innerW, s);
+      const { tracks: junctionTracks, maxCountGlobal } = jdata;
+      const hUnit = d3.scaleSqrt().domain([0, maxCountGlobal]).range([0, 1]);
+
+      // Coverage: multiple tracks stacked vertically with a shared y-domain
+      const covMaxGlobal = d3.max(covTracks, tr => d3.max(tr, d => d.cov)) || 1;
+      const covTop = 0;                 // top of coverage panel (within inner chart)
+      const covBottom = baselineY - 50; // larger gap above exons
+      const panelH = Math.max(1, covBottom - covTop);
+      const lanes = covTracks.length;
+      const laneGap = 15; // px gap between lanes (more breathing room)
+      const laneH = Math.max(8, (panelH - (lanes - 1) * laneGap) / lanes);
+
+      const tracks = covG.selectAll("g.cov-track").data(covTracks);
+      tracks.join(enter => enter.append("g").attr("class", "cov-track"), update => update)
+        .each(function(tr, i) {
+          const gtrack = d3.select(this);
+          const top = covTop + i * (laneH + laneGap);
+          const bottom = top + laneH;
+          const yScale = d3.scaleLinear().domain([0, covMaxGlobal]).range([bottom, top]);
+          // coverage interpolator for endpoints
+          const bisect = d3.bisector(d => d.pos).left;
+          function covAt(pos) {
+            if (!tr || tr.length === 0) return 0;
+            if (pos <= tr[0].pos) return tr[0].cov;
+            if (pos >= tr[tr.length - 1].pos) return tr[tr.length - 1].cov;
+            const idx = Math.max(1, Math.min(tr.length - 1, bisect(tr, pos)));
+            const a = tr[idx - 1], b = tr[idx];
+            const t = (pos - a.pos) / Math.max(1e-9, (b.pos - a.pos));
+            return a.cov * (1 - t) + b.cov * t;
+          }
+
+          const areaGen = d3.area()
+            .x(d => map(d.pos))
+            .y0(bottom)
+            .y1(d => yScale(d.cov))
+            .curve(d3.curveMonotoneX);
+
+          gtrack.selectAll("path.cov-area").data([tr])
+            .join(
+              enter => enter.append("path").attr("class", "cov-area"),
+              update => update
+            )
+            .attr("d", areaGen)
+            .attr("fill", fillColors[i % fillColors.length]);
+
+          // Lane label in the left margin
+          gtrack.selectAll("text.lane-label").data([trackNames[i] || `sample${i+1}`])
+            .join(
+              enter => enter.append("text").attr("class", "lane-label"),
+              update => update
+            )
+            .text(d => d)
+            .attr("x", -8)
+            .attr("y", top + 12);
+
+          // Junction arcs for this lane, drawn within lane band
+          const gJunc = gtrack.selectAll("g.junc").data([null]).join("g").attr("class", "junc");
+          const vis = (junctionTracks[i] || []).filter(d => (d.count ?? 0) >= (minReads ?? 0));
+          const laneMaxH = Math.max(4, (laneH - 6) * 0.8);
+          const arcKey = d => `${d.start}-${d.end}${d.below ? '-b' : ''}`;
+          const arcId = d => `arc-l${i}-${d.start}-${d.end}${d.below ? '-b' : ''}`;
+
+          const paths = gJunc.selectAll("path.arc").data(vis, arcKey);
+          paths.join(
+            enter => enter.append("path").attr("class", "arc"),
+            update => update
+          )
+          .attr("id", d => arcId(d))
+          .attr("stroke", strokeColors[i % strokeColors.length])
+          .attr("stroke-width", d => 1 + 2 * Math.sqrt((d.count || 0) / (maxCountGlobal || 1)))
+          .attr("d", d => {
+            const leftPos = exonRightEdgeAtOrBefore(d.start, exons);
+            const rightPos = exonLeftEdgeAtOrAfter(d.end, exons);
+            const x1 = map(leftPos);
+            const x2 = map(rightPos);
+            const xm = (x1 + x2) / 2;
+            const h = hUnit(d.count || 0) * laneMaxH;
+            const y1 = d.below ? yScale(0) : yScale(covAt(leftPos));
+            const y2 = d.below ? yScale(0) : yScale(covAt(rightPos));
+            const ym = d.below ? Math.max(y1, y2) + h : Math.min(y1, y2) - h;
+            return `M${x1},${y1} Q${xm},${ym} ${x2},${y2}`;
+          });
+
+          // Junction count labels along each arc path
+          const labels = gJunc.selectAll("text.arc-label").data(vis, arcKey);
+          const labelsEnter = labels.join(
+            enter => enter.append("text").attr("class", "arc-label"),
+            update => update
+          );
+          labelsEnter.style("fill", strokeColors[i % strokeColors.length]);
+          labelsEnter.selectAll("textPath").data(d => [d]).join(
+            enter => enter.append("textPath"),
+            update => update
+          )
+          .attr("startOffset", "50%")
+          .attr("text-anchor", "middle")
+          .attr("href", d => `#${arcId(d)}`)
+          .attr("xlink:href", d => `#${arcId(d)}`)
+          .text(d => d.count);
+          labelsEnter.attr("dy", d => d.below ? 10 : -4);
+        });
+
+      // Exons
+      const rects = exonG.selectAll("rect").data(exons, d => d.start + "-" + d.end);
+      rects.join(
+        enter => enter.append("rect").attr("class", "exon")
+          .attr("y", baselineY - exonHeight / 2)
+          .attr("height", exonHeight)
+          .attr("rx", 3).attr("ry", 3)
+          .attr("x", d => map(d.start))
+          .attr("width", d => Math.max(1, map(d.end) - map(d.start))),
+        update => update
+          .attr("x", d => map(d.start))
+          .attr("width", d => Math.max(1, map(d.end) - map(d.start)))
+      );
+
+      // Arcs are now drawn per-lane above
+    }
+
+    // Slider wiring
+    const slider = document.getElementById("intronScale");
+    const label = document.getElementById("scaleLabel");
+    const minSlider = document.getElementById("minCount");
+    const minLabel = document.getElementById("minLabel");
+
+    // Initialize bounds; recomputed on each update based on selected event
+    minSlider.min = 0;
+    minSlider.step = 1;
+    minSlider.value = 0;
+
+    function update() {
+      const s = parseFloat(slider.value);
+      const m = parseInt(minSlider.value, 10) || 0;
+      // Get current event's gene and coverage
+      const exons = eventDefs[currentEvent].exons;
+      const coverageTracks = buildCoverageTracks(exons);
+      // Build junctions for current event and adjust slider max
+      const jdata = buildJunctionTracksForEvent(currentEvent, coverageTracks);
+      minSlider.max = Math.max(1, Math.ceil(jdata.maxCountGlobal));
+      if (m > jdata.maxCountGlobal) {
+        minSlider.value = String(Math.ceil(jdata.maxCountGlobal));
+      }
+      label.textContent = s.toFixed(2);
+      minLabel.textContent = String(m);
+      draw(s, parseInt(minSlider.value, 10) || 0, jdata, coverageTracks, exons);
+    }
+    slider.addEventListener("input", update);
+    minSlider.addEventListener("input", update);
+    window.addEventListener("resize", update);
+    drawHeatmap();
+    update();
+  </script>
+</body>
+<!--
+How to use:
+- Open this file directly in your browser (no build needed).
+- Replace the example `exons` and `junctions` arrays with your data.
+- The slider α compresses introns: display_len = exon_len + intron_len * α.
+-->
+</html>
